@@ -1,0 +1,66 @@
+[
+  {
+    "vtime": 0,
+    "events": [
+      {
+        "action": "CGROUP_CREATE",
+        "cgroupId": "batch",
+        "cpuShares": 512,
+        "cpuQuotaUs": null,
+        "cpuPeriodUs": null,
+        "cpuMask": [0, 1]
+      },
+      {
+        "action": "TASK_CREATE",
+        "taskId": "t1",
+        "nice": 0,
+        "vruntime": 0,
+        "cpuMask": [0],
+        "cgroupId": "batch"
+      },
+      {
+        "action": "TASK_CREATE",
+        "taskId": "t2",
+        "nice": 5,
+        "vruntime": 0,
+        "cpuMask": [1]
+      }
+    ]
+  },
+  {
+    "vtime": 10,
+    "events": [
+      {
+        "action": "TASK_SET_AFFINITY",
+        "taskId": "t2",
+        "cpuMask": [0, 1]
+      },
+      {
+        "action": "TASK_MOVE_CGROUP",
+        "taskId": "t2",
+        "newCgroupId": "batch"
+      }
+    ]
+  },
+  {
+    "vtime": 20,
+    "events": [
+      {
+        "action": "TASK_BLOCK",
+        "taskId": "t1"
+      },
+      {
+        "action": "TASK_UNBLOCK",
+        "taskId": "t1"
+      },
+      {
+        "action": "CGROUP_MODIFY",
+        "cgroupId": "batch",
+        "cpuShares": 1024,
+        "cpuQuotaUs": 20000,
+        "cpuPeriodUs": 100000,
+        "cpuMask": [0, 1]
+      }
+    ]
+  }
+]
