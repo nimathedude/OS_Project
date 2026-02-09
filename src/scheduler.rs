@@ -369,25 +369,62 @@ impl Scheduler {
         })
     }
 
+    fn get_action<'a>(obj: &'a serde_json::Map<String, Value>) -> Option<&'a str> {
+        obj.get("action")
+            .and_then(|v| v.as_str())
+            .or_else(|| obj.get("type").and_then(|v| v.as_str()))
+            .or_else(|| obj.get("event").and_then(|v| v.as_str()))
+    }
+
+    fn get_task_id<'a>(obj: &'a serde_json::Map<String, Value>) -> Option<&'a str> {
+        obj.get("taskId")
+            .and_then(|v| v.as_str())
+            .or_else(|| obj.get("id").and_then(|v| v.as_str()))
+    }
+
+    fn get_cgroup_id<'a>(obj: &'a serde_json::Map<String, Value>) -> Option<&'a str> {
+        obj.get("cgroupId")
+            .and_then(|v| v.as_str())
+            .or_else(|| obj.get("cgroup").and_then(|v| v.as_str()))
+    }
+
+    fn parse_cpu_mask_array(mask: &[Value]) -> Result<u64> {
+        let mut bits: u64 = 0;
+        for v in mask {
+            let idx = v
+                .as_u64()
+                .ok_or_else(|| anyhow!("cpuMask entry must be int"))?;
+            if idx >= 64 {
+                return Err(anyhow!("cpu index out of range: {}", idx));
+            }
+            bits |= 1u64 << idx;
+        }
+        Ok(bits)
+    }
+
+    fn get_cpu_mask(obj: &serde_json::Map<String, Value>, array_key: &str, legacy_key: &str) -> Result<Option<u64>> {
+        if let Some(arr) = obj.get(array_key).and_then(|v| v.as_array()) {
+            return Ok(Some(Self::parse_cpu_mask_array(arr)?));
+        }
+        if let Some(mask) = obj.get(legacy_key).and_then(|v| v.as_u64()) {
+            return Ok(Some(mask));
+        }
+        Ok(None)
+    }
+
     fn apply_event(&mut self, world: &mut World, ev: &Value) -> Result<()> {
         let obj = ev.as_object().ok_or_else(|| anyhow!("event not object"))?;
-        let typ = obj
-            .get("type")
-            .and_then(|v| v.as_str())
-            .or_else(|| obj.get("event").and_then(|v| v.as_str()))
-            .unwrap_or("UNKNOWN");
+        let typ = Self::get_action(obj).unwrap_or("UNKNOWN");
 
         match typ {
             "TASK_CREATE" => {
-                let id = obj
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("TASK_CREATE missing id"))?
+                let id = Self::get_task_id(obj)
+                    .ok_or_else(|| anyhow!("TASK_CREATE missing taskId"))?
                     .to_string();
                 let nice = obj.get("nice").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
                 let vr = obj.get("vruntime").and_then(|v| v.as_i64()).unwrap_or(0);
-                let aff = obj.get("affinity").and_then(|v| v.as_u64()).unwrap_or(!0u64);
-                let cgroup = obj.get("cgroup").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let aff = Self::get_cpu_mask(obj, "cpuMask", "affinity")?.unwrap_or(!0u64);
+                let cgroup = Self::get_cgroup_id(obj).map(|s| s.to_string());
 
                 let t = Task::new(id.clone(), nice, vr, aff, cgroup);
                 world.tasks.insert(id.clone(), t);
@@ -395,21 +432,21 @@ impl Scheduler {
             }
 
             "TASK_EXIT" => {
-                let id = obj.get("id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("TASK_EXIT missing id"))?;
+                let id = Self::get_task_id(obj).ok_or_else(|| anyhow!("TASK_EXIT missing taskId"))?;
                 if let Some(t) = world.tasks.get_mut(id) {
                     t.state = TaskState::Exited;
                 }
             }
 
             "TASK_BLOCK" => {
-                let id = obj.get("id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("TASK_BLOCK missing id"))?;
+                let id = Self::get_task_id(obj).ok_or_else(|| anyhow!("TASK_BLOCK missing taskId"))?;
                 if let Some(t) = world.tasks.get_mut(id) {
                     t.state = TaskState::Blocked;
                 }
             }
 
             "TASK_UNBLOCK" => {
-                let id = obj.get("id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("TASK_UNBLOCK missing id"))?;
+                let id = Self::get_task_id(obj).ok_or_else(|| anyhow!("TASK_UNBLOCK missing taskId"))?;
                 let min_vr = Self::min_vruntime(world);
                 if let Some(t) = world.tasks.get_mut(id) {
                     t.state = TaskState::Runnable;
@@ -421,7 +458,7 @@ impl Scheduler {
             }
 
             "TASK_YIELD" => {
-                let id = obj.get("id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("TASK_YIELD missing id"))?;
+                let id = Self::get_task_id(obj).ok_or_else(|| anyhow!("TASK_YIELD missing taskId"))?;
                 let max_vr = Self::max_vruntime(world);
                 if let Some(t) = world.tasks.get_mut(id) {
                     t.vruntime = max_vr;
@@ -430,8 +467,11 @@ impl Scheduler {
             }
 
             "TASK_SETNICE" => {
-                let id = obj.get("id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("TASK_SETNICE missing id"))?;
-                let nice = obj.get("nice").and_then(|v| v.as_i64()).ok_or_else(|| anyhow!("TASK_SETNICE missing nice"))? as i32;
+                let id = Self::get_task_id(obj).ok_or_else(|| anyhow!("TASK_SETNICE missing taskId"))?;
+                let nice = obj
+                    .get("nice")
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| anyhow!("TASK_SETNICE missing nice"))? as i32;
                 if let Some(t) = world.tasks.get_mut(id) {
                     t.set_nice(nice);
                 }
@@ -439,8 +479,9 @@ impl Scheduler {
             }
 
             "TASK_SET_AFFINITY" => {
-                let id = obj.get("id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("TASK_SET_AFFINITY missing id"))?;
-                let mask = obj.get("affinity").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("TASK_SET_AFFINITY missing affinity"))?;
+                let id = Self::get_task_id(obj).ok_or_else(|| anyhow!("TASK_SET_AFFINITY missing taskId"))?;
+                let mask = Self::get_cpu_mask(obj, "cpuMask", "affinity")?
+                    .ok_or_else(|| anyhow!("TASK_SET_AFFINITY missing cpuMask"))?;
                 if let Some(t) = world.tasks.get_mut(id) {
                     t.affinity_mask = mask;
                 }
@@ -448,8 +489,12 @@ impl Scheduler {
             }
 
             "TASK_MOVE_CGROUP" => {
-                let id = obj.get("id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("TASK_MOVE_CGROUP missing id"))?;
-                let cg = obj.get("cgroup").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let id = Self::get_task_id(obj).ok_or_else(|| anyhow!("TASK_MOVE_CGROUP missing taskId"))?;
+                let cg = obj
+                    .get("newCgroupId")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| Self::get_cgroup_id(obj).map(|s| s.to_string()));
                 if let Some(t) = world.tasks.get_mut(id) {
                     t.cgroup = cg;
                 }
@@ -457,32 +502,48 @@ impl Scheduler {
             }
 
             "CGROUP_CREATE" => {
-                let id = obj.get("id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("CGROUP_CREATE missing id"))?.to_string();
+                let id = Self::get_cgroup_id(obj)
+                    .ok_or_else(|| anyhow!("CGROUP_CREATE missing cgroupId"))?
+                    .to_string();
                 let mut cg = Cgroup::new(id.clone());
-                if let Some(sh) = obj.get("cpu_shares").and_then(|v| v.as_i64()) {
+                if let Some(sh) = obj
+                    .get("cpuShares")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| obj.get("cpu_shares").and_then(|v| v.as_i64()))
+                {
                     cg.cpu_shares = (sh as i64).max(1) as u32;
                 }
-                if let Some(mask) = obj.get("cpu_mask").and_then(|v| v.as_u64()) {
+                if let Some(mask) = Self::get_cpu_mask(obj, "cpuMask", "cpu_mask")? {
                     cg.cpu_mask = mask;
                 }
+                let _cpu_quota = obj.get("cpuQuotaUs").and_then(|v| v.as_i64());
+                let _cpu_period = obj.get("cpuPeriodUs").and_then(|v| v.as_i64());
                 world.cgroups.insert(id.clone(), cg);
                 self.push_cgroup(world, &id);
             }
 
             "CGROUP_MODIFY" => {
-                let id = obj.get("id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("CGROUP_MODIFY missing id"))?.to_string();
+                let id = Self::get_cgroup_id(obj)
+                    .ok_or_else(|| anyhow!("CGROUP_MODIFY missing cgroupId"))?
+                    .to_string();
                 let cg = world.cgroups.entry(id.clone()).or_insert_with(|| Cgroup::new(id.clone()));
-                if let Some(sh) = obj.get("cpu_shares").and_then(|v| v.as_i64()) {
+                if let Some(sh) = obj
+                    .get("cpuShares")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| obj.get("cpu_shares").and_then(|v| v.as_i64()))
+                {
                     cg.cpu_shares = (sh as i64).max(1) as u32;
                 }
-                if let Some(mask) = obj.get("cpu_mask").and_then(|v| v.as_u64()) {
+                if let Some(mask) = Self::get_cpu_mask(obj, "cpuMask", "cpu_mask")? {
                     cg.cpu_mask = mask;
                 }
+                let _cpu_quota = obj.get("cpuQuotaUs").and_then(|v| v.as_i64());
+                let _cpu_period = obj.get("cpuPeriodUs").and_then(|v| v.as_i64());
                 self.push_cgroup(world, &id);
             }
 
             "CGROUP_DELETE" => {
-                let id = obj.get("id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("CGROUP_DELETE missing id"))?;
+                let id = Self::get_cgroup_id(obj).ok_or_else(|| anyhow!("CGROUP_DELETE missing cgroupId"))?;
                 world.cgroups.remove(id);
                 for t in world.tasks.values_mut() {
                     if t.cgroup.as_deref() == Some(id) {
@@ -492,7 +553,7 @@ impl Scheduler {
             }
 
             "CPU_BURST" => {
-                let id = obj.get("id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("CPU_BURST missing id"))?;
+                let id = Self::get_task_id(obj).ok_or_else(|| anyhow!("CPU_BURST missing taskId"))?;
                 if let Some(t) = world.tasks.get_mut(id) {
                     t.burst_mode = true;
                 }
